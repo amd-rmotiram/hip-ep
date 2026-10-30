@@ -40,6 +40,21 @@ module {
   // CHECK: tensor.reshape
   // CHECK-NOT: onnx.DynamicQuantizeLinear
 
+  // Shape refinement inside an If branch can leave y less static than the
+  // input. Compatible shapes still lower.
+  func.func @dql_refined_input(%x: tensor<?x?x512xf32>)
+      -> (tensor<?x?x?xui8>, tensor<f32>, tensor<ui8>) {
+    %y, %scale, %zp = "onnx.DynamicQuantizeLinear"(%x)
+        : (tensor<?x?x512xf32>)
+          -> (tensor<?x?x?xui8>, tensor<f32>, tensor<ui8>)
+    return %y, %scale, %zp
+        : tensor<?x?x?xui8>, tensor<f32>, tensor<ui8>
+  }
+
+  // CHECK-LABEL: func.func @dql_refined_input
+  // CHECK: hip.quantize_linear
+  // CHECK-NOT: onnx.DynamicQuantizeLinear
+
   // Non-f32 input is not this op. Leave it for a later pattern.
   func.func @dql_f16_rejected(%x: tensor<1x1x2x2xf16>)
       -> (tensor<1x1x2x2xui8>, tensor<f32>, tensor<ui8>) {

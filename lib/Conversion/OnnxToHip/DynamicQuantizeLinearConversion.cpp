@@ -155,8 +155,11 @@ mlir::LogicalResult DynamicQuantizeLinearToHip::matchAndRewrite(
   if (!inputType.getElementType().isF32())
     return rewriter.notifyMatchFailure(
         op, "DynamicQuantizeLinear input must be f32");
+  // Shapes need only be compatible: hip-infer-loop-body-shapes can refine an
+  // If-branch input (?x?x512) without refining the result (?x?x?).
   if (!yType.getElementType().isUnsignedInteger(8) ||
-      yType.getShape() != inputType.getShape())
+      mlir::failed(
+          mlir::verifyCompatibleShape(yType.getShape(), inputType.getShape())))
     return rewriter.notifyMatchFailure(
         op, "DynamicQuantizeLinear y must be ui8 with the input shape");
   if (!scaleType.getElementType().isF32() || !isSingleElement(scaleType))
