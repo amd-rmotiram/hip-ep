@@ -21,7 +21,11 @@
 //     or expand_shape), stamps `hipdnn.abi_shape` / `hipdnn.abi_groups` so the
 //     HIP->LLVM lowering issues the output-allocator callback at the returned
 //     graph rank rather than the internal compute rank (see
-//     stampAbiReshapeAttrs).
+//     stampAbiReshapeAttrs),
+//   - when a static output is returned through several reshapes (or one that
+//     keeps the rank), allocates at the returned shape and gives the compute a
+//     collapse + expand view back to its own shape (see
+//     createReturnedShapeAllocationForStaticReshapes).
 //
 // How outputs are found. Rather than listing every view op by hand, the pass
 // asks `BufferViewFlowAnalysis` one question per alloc: does any value derived
@@ -299,6 +303,97 @@ static FailureOr<Value> createExternalRankAllocationForMultiDynExpand(
   return replacement;
 }
 
+/// Return the reshape result nearest to func.return in the view chain from
+/// \p retVal back to \p root, and count the reshapes in that chain. Casts are
+/// transparent; a subview or any other op rejects the chain.
+static Value findOutermostReshape(Value root, Value retVal,
+                                  int64_t &numReshapes) {
+  numReshapes = 0;
+  Value outermost;
+  Value cur = retVal;
+  while (cur != root) {
+    Operation *def = cur.getDefiningOp();
+    if (!def)
+      return {};
+    if (isa<memref::CollapseShapeOp, memref::ExpandShapeOp, memref::ReshapeOp>(
+            def)) {
+      if (!outermost)
+        outermost = cur;
+      ++numReshapes;
+      cur = def->getOperand(0);
+      continue;
+    }
+    if (auto castOp = dyn_cast<memref::CastOp>(def)) {
+      cur = castOp.getSource();
+      continue;
+    }
+    return {};
+  }
+  return outermost;
+}
+
+/// A static graph output can reach func.return through several reshapes, for
+/// example a fused conv that writes [H, W, D, C] which the graph returns as
+/// [1, H, W, D*C] via collapse + expand. abi_shape / abi_groups describe only
+/// one rank-changing reshape, so the output-allocator callback would be asked
+/// for the compute shape and the EP would reject it. Allocate at the returned
+/// shape instead and hand the compute a contiguous view of the same storage:
+///
+///   alloc_output [1, H, W, D*C] -> collapse [N] -> expand [H, W, D, C]
+///
+/// Returns null when the chain is not such a static reshape chain, or when the
+/// single rank-changing reshape case is already covered by abi_shape.
+static Value createReturnedShapeAllocationForStaticReshapes(
+    memref::AllocOp allocOp, Value retVal, Value ctx, int64_t outIdx,
+    OpBuilder &builder) {
+  int64_t numReshapes = 0;
+  Value outermost =
+      findOutermostReshape(allocOp.getResult(), retVal, numReshapes);
+  if (!outermost)
+    return {};
+
+  MemRefType internalType = allocOp.getType();
+  auto externalType = cast<MemRefType>(outermost.getType());
+  if (!internalType.hasStaticShape() || !externalType.hasStaticShape() ||
+      !internalType.getLayout().isIdentity() ||
+      !externalType.getLayout().isIdentity() ||
+      internalType.getMemorySpace() != externalType.getMemorySpace() ||
+      internalType.getRank() == 0 || externalType.getRank() == 0)
+    return {};
+  if (internalType.getShape() == externalType.getShape() ||
+      internalType.getNumElements() != externalType.getNumElements())
+    return {};
+  if (numReshapes == 1 && internalType.getRank() != externalType.getRank())
+    return {};
+
+  auto fullGroup = [](int64_t rank) {
+    ReassociationIndices group;
+    for (int64_t dim = 0; dim < rank; ++dim)
+      group.push_back(dim);
+    return SmallVector<ReassociationIndices>{group};
+  };
+
+  builder.setInsertionPoint(allocOp);
+  Location loc = allocOp.getLoc();
+  auto allocOutput =
+      AllocOutputOp::create(builder, loc, externalType, ctx, ValueRange{},
+                            builder.getI64IntegerAttr(outIdx));
+  Value view = allocOutput.getResult();
+  if (externalType.getRank() != 1) {
+    auto flatType = MemRefType::get(
+        {externalType.getNumElements()}, externalType.getElementType(),
+        MemRefLayoutAttrInterface{}, externalType.getMemorySpace());
+    view = memref::CollapseShapeOp::create(builder, loc, flatType, view,
+                                           fullGroup(externalType.getRank()));
+  }
+  if (internalType.getRank() != 1)
+    view = memref::ExpandShapeOp::create(builder, loc, internalType, view,
+                                         fullGroup(internalType.getRank()));
+  assert(view.getType() == internalType &&
+         "graph-output replacement must match the allocation type");
+  return view;
+}
+
 /// Walk cast / reshape / subview chains back to the buffer they view.
 static Value skipViews(Value value) {
   while (Operation *def = value.getDefiningOp()) {
@@ -425,6 +520,9 @@ struct UseOutputAllocatorPass
           return;
         }
         replacement = *result;
+        if (!replacement)
+          replacement = createReturnedShapeAllocationForStaticReshapes(
+              allocOp, retVal, ctx, outIdx, builder);
       }
 
       AllocOutputOp allocOutput;

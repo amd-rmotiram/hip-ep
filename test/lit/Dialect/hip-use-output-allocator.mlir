@@ -348,13 +348,16 @@ func.func @chain_output(%ctx: !hip.context) -> memref<?xf32> {
 
 // --- A longer 3-op view chain (collapse_shape -> expand_shape -> cast), mixing
 //     all three view-op kinds before the return: the root alloc is still
-//     converted exactly once, and the whole chain is left in place. Proves the
-//     alias analysis follows arbitrary-length chains, not just one or two ops. ---
+//     converted exactly once, and the whole chain is left in place. The two
+//     reshapes return 8x8 from a 2x4x8 buffer, so the output is allocated at
+//     8x8 and the compute gets a 2x4x8 view of it. ---
 // CHECK-LABEL: func.func @long_chain_output
 // CHECK-SAME:    (%[[CTX:.*]]: !hip.context)
 // CHECK-NOT:     memref.alloc
-// CHECK:         %[[OUT:.*]] = hip.alloc_output(%[[CTX]]) {out_idx = 0 : i64} : memref<2x4x8xf32>
-// CHECK:         %[[COL:.*]] = memref.collapse_shape %[[OUT]]
+// CHECK:         %[[OUT:.*]] = hip.alloc_output(%[[CTX]]) {out_idx = 0 : i64} : memref<8x8xf32>
+// CHECK:         %[[FLAT:.*]] = memref.collapse_shape %[[OUT]] {{\[\[}}0, 1]] : memref<8x8xf32> into memref<64xf32>
+// CHECK:         %[[INTERNAL:.*]] = memref.expand_shape %[[FLAT]] {{\[\[}}0, 1, 2]] output_shape [2, 4, 8] : memref<64xf32> into memref<2x4x8xf32>
+// CHECK:         %[[COL:.*]] = memref.collapse_shape %[[INTERNAL]]
 // CHECK:         %[[EXP:.*]] = memref.expand_shape %[[COL]]
 // CHECK:         %[[CST:.*]] = memref.cast %[[EXP]]
 // CHECK:         return %[[CST]]
@@ -396,6 +399,32 @@ func.func @longer_chain_output(%ctx: !hip.context) -> memref<?x8xf32, strided<[8
   %cast = memref.cast %s
         : memref<4x8xf32, strided<[8, 1]>> to memref<?x8xf32, strided<[8, 1]>>
   return %cast : memref<?x8xf32, strided<[8, 1]>>
+}
+
+// --- Same-rank reshape chain from a fused conv (Transpose + Reshape tail):
+//     the kernel writes 24x32x12x3 and the graph returns 1x24x32x36. The
+//     output is allocated at the returned shape, not the compute shape, so the
+//     output-allocator callback is asked for {1,24,32,36}. ---
+// CHECK-LABEL: func.func @same_rank_reshape_chain_output
+// CHECK-SAME:    (%[[CTX:[^:]*]]: !hip.context, %{{.*}}: memref<24x32x12x3xf32>)
+// CHECK-NOT:     memref.alloc
+// CHECK:         %[[OUT:.*]] = hip.alloc_output(%[[CTX]]) {out_idx = 0 : i64} : memref<1x24x32x36xf32>
+// CHECK-NOT:     hipdnn.abi_shape
+// CHECK:         %[[FLAT:.*]] = memref.collapse_shape %[[OUT]] {{\[\[}}0, 1, 2, 3]] : memref<1x24x32x36xf32> into memref<27648xf32>
+// CHECK:         %[[INTERNAL:.*]] = memref.expand_shape %[[FLAT]] {{\[\[}}0, 1, 2, 3]] output_shape [24, 32, 12, 3] : memref<27648xf32> into memref<24x32x12x3xf32>
+// CHECK:         memref.copy %{{.*}}, %[[INTERNAL]] : memref<24x32x12x3xf32> to memref<24x32x12x3xf32>
+// CHECK:         %[[COL:.*]] = memref.collapse_shape %[[INTERNAL]]
+// CHECK:         %[[EXP:.*]] = memref.expand_shape %[[COL]]
+// CHECK:         return %[[EXP]]
+func.func @same_rank_reshape_chain_output(
+    %ctx: !hip.context, %x: memref<24x32x12x3xf32>) -> memref<1x24x32x36xf32> {
+  %buf = memref.alloc() : memref<24x32x12x3xf32>
+  memref.copy %x, %buf : memref<24x32x12x3xf32> to memref<24x32x12x3xf32>
+  %flat = memref.collapse_shape %buf [[0, 1, 2, 3]]
+        : memref<24x32x12x3xf32> into memref<27648xf32>
+  %out = memref.expand_shape %flat [[0, 1, 2, 3]] output_shape [1, 24, 32, 36]
+       : memref<27648xf32> into memref<1x24x32x36xf32>
+  return %out : memref<1x24x32x36xf32>
 }
 
 // --- Output returned through memref.subview: the parent alloc becomes
