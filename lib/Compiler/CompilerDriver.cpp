@@ -115,7 +115,8 @@ void dumpPreFusionIR(mlir::ModuleOp module,
      << " gemm-gemm-accel-types="
      << llvm::join(fuseOpts.gemmGemmAccelTypes, ",")
      << " standalone-elementwise="
-     << (fuseOpts.standaloneElementwise ? "true" : "false") << "\n";
+     << (fuseOpts.standaloneElementwise ? "true" : "false")
+     << " attention=" << (fuseOpts.attention ? "true" : "false") << "\n";
   module->print(os);
 }
 #endif
@@ -474,6 +475,9 @@ bool CompilerDriver::runMLIRPasses(
       // module that no anchor takes as HIP ops, to compare the two paths.
       fuseOpts.standaloneElementwise =
           !hip_env_is_on("HIPDNN_EP_ROCMLIR_NO_STANDALONE_ELEMENTWISE");
+      // HIPDNN_EP_ROCMLIR_NO_ATTENTION=1 keeps attention as two gemm kernels
+      // and a softmax, to compare the two paths.
+      fuseOpts.attention = !hip_env_is_on("HIPDNN_EP_ROCMLIR_NO_ATTENTION");
       if (mlir::failed(headPm.run(module))) {
         error_message = "ONNX->HIP passes before the rocMLIR fusion failed";
         return false;
